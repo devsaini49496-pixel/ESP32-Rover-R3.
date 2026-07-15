@@ -21,4 +21,5 @@ This repository contains the source code for the R3 iteration of my custom-built
 1. Flash the `.ino` file to your ESP32 using the Arduino IDE.
 2. Connect to the ESP32's Wi-Fi access point.
 3. Open a web browser and navigate to the assigned IP address (e.g., 192.168.4.1) to access the control dashboard.
-4. 
+   
+[Click here to view the full Project Report / Schematic](Detail_Pin_Mapping.pdf)
