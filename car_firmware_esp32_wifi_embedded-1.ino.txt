@@ -1,0 +1,851 @@
+// ==========================================================
+// ESP32-WROOM-32 RC car firmware -- WiFi version
+// Runs its own WiFi hotspot (SoftAP) + a tiny web server.
+// Same command protocol as the Bluetooth version: single
+// characters (F,B,L,R,S,M,A,I,X,Y,H,P,Z,U,D), now delivered
+// as HTTP GET requests: http://<car-ip>/cmd?c=X
+// ==========================================================
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// --- WIFI HOTSPOT SETTINGS ---
+const char* AP_SSID     = "ESP32_RC_Car";
+const char* AP_PASSWORD = "drive1234"; // WPA2 requires 8+ characters
+// Default IP in AP mode is always 192.168.4.1 -- this is what the
+// control webpage should point at.
+
+WebServer server(80);
+
+// ==========================================================
+// EMBEDDED CONTROL WEBPAGE
+// Served directly from the ESP32 at "/", so the phone browser
+// just visits http://192.168.4.1 -- no separate HTML file, no
+// content:// file-origin issues, no CORS concerns (same-origin).
+// ==========================================================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>RC-01 WiFi Control</title>
+<style>
+  :root{
+    --bg:#0B0D10; --panel:#14171C; --panel-2:#1B1F26; --line:#262B33;
+    --cyan:#00E5C7; --cyan-dim:#00988679; --amber:#FFB020; --red:#FF4E4E;
+    --text:#E7ECEF; --text-dim:#7C838D;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none;}
+  html,body{
+    height:100%; margin:0;
+    background: radial-gradient(1200px 600px at 50% -10%, #12161c 0%, var(--bg) 60%);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    overflow:hidden; overscroll-behavior:none;
+  }
+  .mono{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;}
+  #app{ height:100dvh; display:flex; flex-direction:column; padding:12px; gap:10px; }
+  .statusbar{
+    display:flex; align-items:center; justify-content:space-between;
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:8px 12px; flex-shrink:0;
+  }
+  .conn-info{display:flex; align-items:center; gap:8px;}
+  .dot{ width:9px; height:9px; border-radius:50%; background:var(--text-dim); transition:.3s; }
+  .dot.on{ background:var(--cyan); box-shadow:0 0 0 4px var(--cyan-dim); }
+  .conn-text{font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--text-dim);}
+  .panel{ display:flex; flex-direction:column; gap:10px; flex-shrink:0; }
+  .modes{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .icon-btn{
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    padding:9px 4px; border-radius:10px; border:1px solid var(--line);
+    background:var(--panel); color:var(--text-dim); font-size:11px; font-weight:600;
+    cursor:pointer;
+  }
+  .icon-btn .emoji{font-size:20px;}
+  .icon-btn.active{ color:var(--bg); background:var(--cyan); border-color:var(--cyan); }
+  .chips{ display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
+  .chip{
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    padding:7px 2px; border-radius:10px; border:1px solid var(--line);
+    background:var(--panel); font-size:9px; font-weight:600; color:var(--text-dim);
+    cursor:pointer;
+  }
+  .chip .emoji{font-size:16px;}
+  .chip.on{ color:var(--text); border-color:var(--amber); }
+  .speed-row{
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:8px 12px;
+  }
+  .speed-btn{
+    width:38px; height:38px; border-radius:9px; border:1px solid var(--line);
+    background:var(--panel-2); color:var(--cyan); font-size:18px; cursor:pointer;
+  }
+  .speed-val{font-size:13px; font-weight:700;}
+  #mainRow{ display:flex; flex:1; min-height:0; gap:10px; }
+  .joywrap{ flex:1; display:flex; align-items:center; justify-content:center; min-height:0; }
+  .joybase{
+    width:min(56vmin,260px); height:min(56vmin,260px);
+    border-radius:50%; border:1px solid var(--line); background:var(--panel);
+    display:flex; align-items:center; justify-content:center; position:relative;
+    touch-action:none;
+  }
+  .joybase::before{
+    content:""; position:absolute; width:34%; height:34%; border-radius:50%;
+    border:1px dashed var(--line);
+  }
+  .joyknob{
+    width:38%; height:38%; border-radius:50%; background:var(--cyan);
+    box-shadow:0 0 20px var(--cyan-dim);
+  }
+  .joy-arrows{ position:absolute; inset:0; color:var(--text-dim); font-size:14px; }
+  .joy-arrows span{ position:absolute; }
+  .arrow-up{ top:8px; left:50%; transform:translateX(-50%); }
+  .arrow-down{ bottom:8px; left:50%; transform:translateX(-50%); }
+  .arrow-left{ left:8px; top:50%; transform:translateY(-50%); }
+  .arrow-right{ right:8px; top:50%; transform:translateY(-50%); }
+  .status-strip{
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:8px 12px; display:flex; justify-content:space-between; align-items:center;
+    flex-shrink:0;
+  }
+  .status-strip .label{font-size:9px; color:var(--text-dim); letter-spacing:.06em; text-transform:uppercase;}
+  .status-strip .value{font-size:13px; font-weight:700; color:var(--cyan);}
+  .toast{
+    position:fixed; left:50%; bottom:16px; transform:translateX(-50%) translateY(10px);
+    background:var(--panel-2); border:1px solid var(--amber); color:var(--text);
+    padding:9px 15px; border-radius:10px; font-size:12px; max-width:88vw;
+    opacity:0; pointer-events:none; transition:.25s; z-index:10;
+  }
+  .toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
+  @media (orientation:landscape){
+    #mainRow{ flex-direction:row; }
+    .panel{ width:44%; overflow-y:auto; }
+    .chips{ grid-template-columns:repeat(3,1fr); }
+  }
+  @media (orientation:portrait){
+    #mainRow{ flex-direction:column; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="statusbar">
+    <div class="conn-info">
+      <div class="dot" id="connDot"></div>
+      <div class="conn-text">LINK <b id="connLabel" class="mono">--</b></div>
+    </div>
+  </div>
+
+  <div id="mainRow">
+    <div class="panel">
+      <div class="modes" role="tablist">
+        <button class="icon-btn active" data-mode="M" id="modeM"><span class="emoji">&#127918;</span>MANUAL</button>
+        <button class="icon-btn" data-mode="A" id="modeA"><span class="emoji">&#129302;</span>AUTO</button>
+        <button class="icon-btn" data-mode="I" id="modeI"><span class="emoji">&#128739;</span>LINE</button>
+      </div>
+      <div class="chips">
+        <div class="chip on" id="chipUS" data-cmd="X"><span class="emoji">&#128225;</span>ULTRA</div>
+        <div class="chip on" id="chipIR" data-cmd="Y"><span class="emoji">&#128065;</span>IR</div>
+        <div class="chip" id="chipLights" data-cmd="H"><span class="emoji">&#128161;</span>LIGHTS</div>
+        <div class="chip" id="chipLed" data-cmd="P"><span class="emoji">&#10024;</span>LED</div>
+        <div class="chip" id="chipBuzz" data-cmd="Z"><span class="emoji">&#128276;</span>BUZZ</div>
+      </div>
+      <div class="speed-row">
+        <button class="speed-btn" id="speedDown">&#128034;</button>
+        <div class="speed-val mono" id="speedVal">240</div>
+        <button class="speed-btn" id="speedUp">&#128007;</button>
+      </div>
+      <div class="status-strip">
+        <div><div class="label">Mode</div><div class="value mono" id="statMode">MANUAL</div></div>
+      </div>
+    </div>
+
+    <div class="joywrap">
+      <div class="joybase" id="joyBase">
+        <div class="joy-arrows">
+          <span class="arrow-up">&#9650;</span>
+          <span class="arrow-down">&#9660;</span>
+          <span class="arrow-left">&#9664;</span>
+          <span class="arrow-right">&#9654;</span>
+        </div>
+        <div class="joyknob" id="joyKnob"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  "use strict";
+  const $ = (id)=>document.getElementById(id);
+  const connDot = $("connDot"), connLabel = $("connLabel");
+  const toast = $("toast");
+  const statMode = $("statMode");
+  const speedVal = $("speedVal");
+
+  let toastTimer = null;
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>toast.classList.remove("show"), 2200);
+  }
+
+  async function sendCmd(c){
+    try{
+      await fetch("/cmd?c=" + encodeURIComponent(c), { method:"GET" });
+    } catch(err){
+      showToast("Send failed");
+    }
+  }
+
+  async function checkConn(){
+    try{
+      const res = await fetch("/ping", { method:"GET" });
+      setConnected(res.ok);
+    } catch(e){
+      setConnected(false);
+    }
+  }
+  function setConnected(on){
+    connDot.classList.toggle("on", on);
+    connLabel.textContent = on ? "ONLINE" : "OFFLINE";
+  }
+  setInterval(checkConn, 3000);
+  checkConn();
+
+  const modeButtons = document.querySelectorAll(".icon-btn[data-mode]");
+  function setMode(mode, label){
+    modeButtons.forEach(b=>b.classList.toggle("active", b.dataset.mode===mode));
+    statMode.textContent = label;
+    sendCmd(mode);
+  }
+  $("modeM").addEventListener("click", ()=>setMode("M","MANUAL"));
+  $("modeA").addEventListener("click", ()=>setMode("A","AUTO"));
+  $("modeI").addEventListener("click", ()=>setMode("I","LINE"));
+
+  [["chipUS","X"],["chipIR","Y"],["chipLights","H"],["chipLed","P"],["chipBuzz","Z"]].forEach(([id,cmd])=>{
+    const el = $(id);
+    el.addEventListener("click", ()=>{
+      el.classList.toggle("on");
+      sendCmd(cmd);
+    });
+  });
+
+  let speed = 240;
+  const SPEED_MIN = 120, SPEED_MAX = 255, SPEED_STEP = 15;
+  $("speedUp").addEventListener("click", ()=>{
+    speed = Math.min(speed + SPEED_STEP, SPEED_MAX);
+    speedVal.textContent = speed;
+    sendCmd("U");
+  });
+  $("speedDown").addEventListener("click", ()=>{
+    speed = Math.max(speed - SPEED_STEP, SPEED_MIN);
+    speedVal.textContent = speed;
+    sendCmd("D");
+  });
+
+  const base = $("joyBase"), knob = $("joyKnob");
+  let dragging = false, centerX = 0, centerY = 0, maxRadius = 1;
+  let currentZone = "C";
+
+  function beginDrag(e){
+    dragging = true;
+    const rect = base.getBoundingClientRect();
+    centerX = rect.left + rect.width/2;
+    centerY = rect.top + rect.height/2;
+    maxRadius = rect.width/2;
+    try{ base.setPointerCapture(e.pointerId); }catch(err){}
+    moveDrag(e);
+  }
+  function moveDrag(e){
+    if(!dragging) return;
+    const dx = e.clientX - centerX;
+    const dy = e.clientY - centerY;
+    const dist = Math.min(Math.hypot(dx,dy), maxRadius);
+    const angle = Math.atan2(dy,dx);
+    const kx = Math.cos(angle) * dist * 0.6;
+    const ky = Math.sin(angle) * dist * 0.6;
+    knob.style.transform = "translate(" + kx + "px," + ky + "px)";
+    const deadzone = maxRadius * 0.28;
+    let zone = "C";
+    if (Math.hypot(dx,dy) > deadzone){
+      const deg = angle * 180 / Math.PI;
+      if (deg > -45 && deg <= 45) zone = "R";
+      else if (deg > 45 && deg <= 135) zone = "B";
+      else if (deg > 135 || deg <= -135) zone = "L";
+      else zone = "F";
+    }
+    if (zone !== currentZone){
+      currentZone = zone;
+      if (zone === "C") sendCmd("S");
+      else sendCmd(zone);
+    }
+  }
+  function endDrag(e){
+    if(!dragging) return;
+    dragging = false;
+    knob.style.transform = "translate(0px,0px)";
+    if (currentZone !== "C"){
+      currentZone = "C";
+      sendCmd("S");
+    }
+  }
+  base.addEventListener("pointerdown", beginDrag);
+  base.addEventListener("pointermove", moveDrag);
+  base.addEventListener("pointerup", endDrag);
+  base.addEventListener("pointercancel", endDrag);
+  base.addEventListener("pointerleave", (e)=>{ if(dragging) endDrag(e); });
+})();
+</script>
+</body>
+</html>
+)rawliteral";
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- MOTOR PINS ---
+int enA = 25; int in1 = 26; int in2 = 27;
+int enB = 33; int in3 = 23; int in4 = 13;
+
+// --- SENSOR PINS ---
+int trigPin = 32; int echoPin = 35;
+int leftIR_Front = 34; int rightIR_Front = 39;
+int leftIR_Back = 36;  int rightIR_Back = 4;
+
+// --- EXTRAS ---
+int servoPin = 18;
+int buzzer = 19;
+int lights = 17;
+int ledPin = 2;
+Servo scanServo;
+
+// I2C for OLED: default SDA=21 / SCL=22
+
+// --- SYSTEM VARIABLES ---
+char currentCommand = 'S'; 
+char carMode = 'M'; 
+
+int manualSpeed = 240;
+const int SPEED_MIN = 120;
+const int SPEED_MAX = 255;
+const int SPEED_STEP = 15;
+
+bool usEnabled = true;
+bool irEnabled = true;
+bool lightsEnabled = false;
+bool led13Enabled = false;
+bool manualBuzzerOn = false;
+
+// --- DISPLAY VARIABLES ---
+const char* displayMode = "MANUAL";
+const char* displayAction = "STOP";
+const char* lastMode = "";
+const char* lastAction = "";
+
+unsigned long rotateStartTime = 0;
+bool isRotating = false;
+
+// --- NON-BLOCKING BUZZER STATE MACHINE ---
+enum BuzzerState { BUZZ_IDLE, BUZZ_ON, BUZZ_GAP };
+BuzzerState buzzerState = BUZZ_IDLE;
+unsigned long buzzerTimer = 0;
+int buzzerBeepsRemaining = 0;
+const unsigned long BEEP_ON_MS = 150;
+const unsigned long BEEP_GAP_MS = 100;
+
+void startBeep(int count) {
+  buzzerBeepsRemaining = count - 1; 
+  digitalWrite(buzzer, HIGH);
+  buzzerTimer = millis();
+  buzzerState = BUZZ_ON;
+}
+
+void updateBuzzer() {
+  if (manualBuzzerOn) {
+    digitalWrite(buzzer, HIGH);
+    return;
+  }
+  unsigned long now = millis();
+  if (buzzerState == BUZZ_ON && now - buzzerTimer >= BEEP_ON_MS) {
+    digitalWrite(buzzer, LOW);
+    buzzerTimer = now;
+    buzzerState = (buzzerBeepsRemaining > 0) ? BUZZ_GAP : BUZZ_IDLE;
+  } else if (buzzerState == BUZZ_GAP && now - buzzerTimer >= BEEP_GAP_MS) {
+    digitalWrite(buzzer, HIGH);
+    buzzerTimer = now;
+    buzzerBeepsRemaining--;
+    buzzerState = BUZZ_ON;
+  }
+}
+
+// --- WIFI-AWARE SMART DELAY ---
+volatile bool interruptFlag = false;
+
+bool smartDelay(unsigned long ms) {
+  unsigned long start = millis();
+  interruptFlag = false;
+  while (millis() - start < ms) {
+    updateBuzzer();
+    server.handleClient();
+    if (interruptFlag) return false;
+  }
+  return true;
+}
+
+// --- DEFERRED BANNER FLAGS ---
+volatile bool pendingModeBanner = false;
+const char* pendingBannerLine1 = "";
+const char* pendingBannerLine2 = "";
+
+volatile bool pendingConnectBanner = false;
+bool wifiClientConnected = false;
+
+void WiFiEventHandler(WiFiEvent_t event) {
+  if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+    if (!wifiClientConnected) {
+      wifiClientConnected = true;
+      pendingConnectBanner = true;
+    }
+  }
+}
+
+// --- HTTP HANDLERS ---
+void handleCmd() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  if (!server.hasArg("c") || server.arg("c").length() == 0) {
+    server.send(400, "text/plain", "missing c");
+    return;
+  }
+  char incoming = server.arg("c").charAt(0);
+
+  if (incoming == 'A') {
+    carMode = 'A'; displayMode = "AUTO"; stopCar(); startBeep(1);
+    pendingBannerLine1 = "AUTOMATIC"; pendingBannerLine2 = "MODE"; pendingModeBanner = true;
+    interruptFlag = true;
+  }
+  else if (incoming == 'I') {
+    carMode = 'I'; displayMode = "LINE"; stopCar(); startBeep(1);
+    pendingBannerLine1 = "LINE"; pendingBannerLine2 = "MODE"; pendingModeBanner = true;
+    interruptFlag = true;
+  }
+  else if (incoming == 'M') {
+    carMode = 'M'; displayMode = "MANUAL"; stopCar(); startBeep(1);
+    pendingBannerLine1 = "MANUAL"; pendingBannerLine2 = "MODE"; pendingModeBanner = true;
+    interruptFlag = true;
+  }
+  else if (incoming == 'X') { usEnabled = !usEnabled; startBeep(usEnabled ? 1 : 2); }
+  else if (incoming == 'Y') { irEnabled = !irEnabled; startBeep(irEnabled ? 1 : 2); }
+  else if (incoming == 'H') {
+    lightsEnabled = !lightsEnabled;
+    digitalWrite(lights, lightsEnabled ? HIGH : LOW);
+    startBeep(lightsEnabled ? 1 : 2);
+  }
+  else if (incoming == 'P') {
+    led13Enabled = !led13Enabled;
+    digitalWrite(ledPin, led13Enabled ? HIGH : LOW);
+    startBeep(led13Enabled ? 1 : 2);
+  }
+  else if (incoming == 'Z') {
+    manualBuzzerOn = !manualBuzzerOn;
+    if (!manualBuzzerOn) { digitalWrite(buzzer, LOW); buzzerState = BUZZ_IDLE; }
+  }
+  else if (incoming == 'U') { manualSpeed = min(manualSpeed + SPEED_STEP, SPEED_MAX); startBeep(1); }
+  else if (incoming == 'D') { manualSpeed = max(manualSpeed - SPEED_STEP, SPEED_MIN); startBeep(1); }
+  else if (incoming == 'F' || incoming == 'B' || incoming == 'L' || incoming == 'R' || incoming == 'S') {
+    if (carMode == 'M') currentCommand = incoming;
+    if (incoming == 'S') interruptFlag = true;
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+void handlePing() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleNotFound() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(404, "text/plain", "Not found");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(buzzer, OUTPUT);
+  digitalWrite(buzzer, HIGH); delay(150); digitalWrite(buzzer, LOW);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+  }
+
+  showBanner("HELLO!", "WAKING UP...");
+  delay(1200);
+  faceWakeUp();
+  delay(200);
+  faceSmile();
+  delay(1200);
+
+  pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+
+  pinMode(trigPin, OUTPUT); pinMode(echoPin, INPUT);
+  pinMode(leftIR_Front, INPUT); pinMode(rightIR_Front, INPUT);
+  pinMode(leftIR_Back, INPUT);  pinMode(rightIR_Back, INPUT);
+
+  pinMode(lights, OUTPUT); digitalWrite(lights, LOW);
+  pinMode(ledPin, OUTPUT); digitalWrite(ledPin, LOW);
+
+  scanServo.setPeriodHertz(50);
+  scanServo.attach(servoPin);
+  scanServo.write(90);
+
+  WiFi.onEvent(WiFiEventHandler);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("Car WiFi IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/cmd", HTTP_GET, handleCmd);
+  server.on("/ping", HTTP_GET, handlePing);
+  server.onNotFound(handleNotFound);
+  server.begin();
+}
+
+void loop() {
+  updateBuzzer();
+  server.handleClient();
+
+  if (pendingConnectBanner) {
+    pendingConnectBanner = false;
+    startBeep(1);
+    showBanner("CONNECTED", "TO WIFI");
+    smartDelay(1000);
+    showBanner("MANUAL", "MODE");
+    smartDelay(1000);
+    updateScreenForce();
+  }
+
+  if (pendingModeBanner) {
+    pendingModeBanner = false;
+    showBanner(pendingBannerLine1, pendingBannerLine2);
+    smartDelay(1000);
+    updateScreenForce();
+  }
+
+  // ==========================================
+  // MODE 'M': MANUAL DRIVING
+  // ==========================================
+  if (carMode == 'M') {
+    bool canMoveForward = true;
+    bool canMoveBackward = true;
+
+    if (currentCommand == 'L' || currentCommand == 'R') {
+      if (!isRotating) {
+        isRotating = true;
+        rotateStartTime = millis();
+      } else if (millis() - rotateStartTime >= 6000) {
+        stopCar(); currentCommand = 'S'; displayAction = "STOP";
+        showAngryFace();
+        smartDelay(4000);
+        isRotating = false; lastAction = "";
+      }
+    } else { isRotating = false; }
+
+    int distance = 999;
+    int fLeft = LOW, fRight = LOW, bLeft = LOW, bRight = LOW;
+
+    if (usEnabled) { distance = getDistance(); }
+    if (irEnabled) {
+      fLeft = digitalRead(leftIR_Front); fRight = digitalRead(rightIR_Front);
+      bLeft = digitalRead(leftIR_Back);  bRight = digitalRead(rightIR_Back);
+    }
+
+    if ((irEnabled && (fLeft == HIGH || fRight == HIGH)) || (usEnabled && distance > 0 && distance <= 15)) {
+      if (currentCommand == 'F') {
+        stopCar(); startBeep(1);
+        displayAction = "CLIFF/OBS!"; updateScreenForce();
+        driveBackward(255);
+        smartDelay(350);
+        stopCar(); currentCommand = 'S';
+      }
+      canMoveForward = false;
+    }
+
+    if (irEnabled && (bLeft == HIGH || bRight == HIGH)) {
+      if (currentCommand == 'B') {
+        stopCar(); startBeep(1);
+        displayAction = "CLIFF!"; updateScreenForce();
+        driveForward(255);
+        smartDelay(350);
+        stopCar(); currentCommand = 'S';
+      }
+      canMoveBackward = false;
+    }
+
+    int fwdSpd  = constrain(manualSpeed,      0, 255);
+    int bwdSpd  = constrain(manualSpeed - 10, 0, 255);
+    int turnSpd = constrain(manualSpeed - 40, 0, 255);
+
+    if (currentCommand == 'F' && canMoveForward) { driveForward(fwdSpd); displayAction = "FORWARD"; }
+    else if (currentCommand == 'B' && canMoveBackward) { driveBackward(bwdSpd); displayAction = "REVERSE"; }
+    else if (currentCommand == 'L') { driveLeft(turnSpd); displayAction = "LEFT"; }
+    else if (currentCommand == 'R') { driveRight(turnSpd); displayAction = "RIGHT"; }
+    else if (currentCommand == 'S' || (!canMoveForward && currentCommand == 'F') || (!canMoveBackward && currentCommand == 'B')) {
+      stopCar(); displayAction = "STOP";
+    }
+  }
+
+  // ==========================================
+  // MODE 'A': AUTONOMOUS AVOIDANCE
+  // ==========================================
+  else if (carMode == 'A') {
+    int fLeft = LOW, fRight = LOW, distance = 999;
+
+    if (irEnabled) {
+      fLeft = digitalRead(leftIR_Front);
+      fRight = digitalRead(rightIR_Front);
+    }
+
+    if (irEnabled && (fLeft == HIGH || fRight == HIGH)) {
+        stopCar();
+        displayAction = "CLIFF!"; updateScreenForce();
+        driveBackward(255);
+        if (!smartDelay(400)) return;
+        driveRight(200);
+        if (!smartDelay(600)) return;
+        stopCar();
+    }
+    else {
+      if (usEnabled) { distance = getDistance(); }
+
+      if (usEnabled && distance > 0 && distance <= 25) {
+        stopCar();
+        displayAction = "SCANNING"; updateScreenForce();
+
+        if (!smartDelay(200)) return;
+        scanServo.write(180);
+        faceLookLeft();
+        if (!smartDelay(400)) return;
+        int leftDist = getDistance();
+
+        scanServo.write(0);
+        faceLookRight();
+        if (!smartDelay(600)) return;
+        int rightDist = getDistance();
+
+        scanServo.write(90);
+        faceNormal();
+        if (!smartDelay(400)) return;
+
+        if (leftDist > rightDist && leftDist > 25) {
+          displayAction = "TURN L"; updateScreenForce();
+          driveLeft(200); if (!smartDelay(400)) return;
+        } else if (rightDist > leftDist && rightDist > 25) {
+          displayAction = "TURN R"; updateScreenForce();
+          driveRight(200); if (!smartDelay(400)) return;
+        } else {
+          displayAction = "TURN AROUND"; updateScreenForce();
+          driveBackward(200); if (!smartDelay(500)) return;
+          driveRight(200); if (!smartDelay(800)) return;
+        }
+        stopCar();
+      } else {
+        driveForward(150);
+        displayAction = "FORWARD";
+      }
+    }
+  }
+
+  // ==========================================
+  // MODE 'I': LINE FOLLOWER
+  // ==========================================
+  else if (carMode == 'I') {
+    if (irEnabled) {
+      int leftVal = digitalRead(leftIR_Front);
+      int rightVal = digitalRead(rightIR_Front);
+      int lineSpeed = 160;
+
+      if (leftVal == LOW && rightVal == LOW) { driveForward(lineSpeed); displayAction = "FORWARD"; }
+      else if (leftVal == HIGH && rightVal == LOW) { driveLeft(lineSpeed + 60); displayAction = "LEFT"; }
+      else if (leftVal == LOW && rightVal == HIGH) { driveRight(lineSpeed + 60); displayAction = "RIGHT"; }
+      else { stopCar(); displayAction = "STOP"; }
+    } else {
+      stopCar();
+      displayAction = "IR IS OFF!";
+    }
+  }
+
+  if (strcmp(displayMode, lastMode) != 0 || strcmp(displayAction, lastAction) != 0) {
+    updateScreenForce();
+  }
+}
+
+// ==========================================
+// --- FACE / DISPLAY SYSTEM (unchanged, board-agnostic) ---
+// ==========================================
+
+void drawEyes(int w, int h, int xShift, int yShift, int radius) {
+  display.clearDisplay();
+  int gap = 14;
+  int totalW = w * 2 + gap;
+  int leftX = (SCREEN_WIDTH - totalW) / 2 + xShift;
+  int rightX = leftX + w + gap;
+  int y = (SCREEN_HEIGHT - h) / 2 + yShift;
+  if (radius > h / 2) radius = h / 2;
+  if (radius > w / 2) radius = w / 2;
+  display.fillRoundRect(leftX, y, w, h, radius, WHITE);
+  display.fillRoundRect(rightX, y, w, h, radius, WHITE);
+  display.display();
+}
+
+void showBanner(const char* line1, const char* line2) {
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  display.setTextSize(2);
+  int16_t x1, y1; uint16_t w1, h1;
+  display.getTextBounds(line1, 0, 0, &x1, &y1, &w1, &h1);
+  display.setCursor((SCREEN_WIDTH - w1) / 2, 14);
+  display.print(line1);
+
+  display.setTextSize(1);
+  int16_t x2, y2; uint16_t w2, h2;
+  display.getTextBounds(line2, 0, 0, &x2, &y2, &w2, &h2);
+  display.setCursor((SCREEN_WIDTH - w2) / 2, 40);
+  display.print(line2);
+
+  display.display();
+}
+
+void faceSmile() { drawEyes(34, 34, 0, 0, 16); }
+
+void faceExcited() {
+  display.clearDisplay();
+  int w = 34, h = 38, gap = 14;
+  int totalW = w * 2 + gap;
+  int leftX = (SCREEN_WIDTH - totalW) / 2;
+  int rightX = leftX + w + gap;
+  int y = (SCREEN_HEIGHT - h) / 2 - 2;
+  display.fillRoundRect(leftX, y, w, h, 16, WHITE);
+  display.fillRoundRect(rightX, y, w, h, 16, WHITE);
+  display.fillTriangle(leftX, y - 2, leftX + w, y - 2, leftX + w / 2, y - 8, WHITE);
+  display.fillTriangle(rightX, y - 2, rightX + w, y - 2, rightX + w / 2, y - 8, WHITE);
+  display.display();
+}
+
+void faceNormal() { drawEyes(30, 26, 0, 2, 10); }
+void faceLookLeft() { drawEyes(30, 26, -20, 2, 10); }
+void faceLookRight() { drawEyes(30, 26, 20, 2, 10); }
+
+void faceFear() {
+  display.clearDisplay();
+  int w = 22, h = 22, gap = 20;
+  int totalW = w * 2 + gap;
+  int leftX = (SCREEN_WIDTH - totalW) / 2;
+  int rightX = leftX + w + gap;
+  int y = (SCREEN_HEIGHT - h) / 2;
+  display.fillRoundRect(leftX, y, w, h, 6, WHITE);
+  display.fillRoundRect(rightX, y, w, h, 6, WHITE);
+  display.fillTriangle(leftX + w - 10, y, leftX + w, y - 8, leftX + w, y, WHITE);
+  display.fillTriangle(rightX, y - 8, rightX, y, rightX + 10, y, WHITE);
+  display.display();
+}
+
+void faceSurprised() { drawEyes(26, 40, 0, -2, 13); }
+
+void faceWakeUp() {
+  drawEyes(34, 6, 0, 14, 3);
+  delay(250);
+  drawEyes(34, 18, 0, 8, 8);
+  delay(250);
+  drawEyes(34, 34, 0, 0, 16);
+  delay(250);
+}
+
+void showAngryFace() {
+  display.clearDisplay();
+  display.fillTriangle(30, 15, 50, 25, 30, 25, WHITE);
+  display.fillTriangle(98, 15, 78, 25, 98, 25, WHITE);
+  display.fillRect(35, 26, 15, 8, WHITE);
+  display.fillRect(78, 26, 15, 8, WHITE);
+  display.fillRect(44, 50, 40, 3, WHITE);
+
+  display.setTextSize(2);
+  display.setCursor(5, 0);
+  display.print(F("TOO DIZZY!"));
+  display.display();
+}
+
+void updateScreenForce() {
+  if (strcmp(displayAction, "FORWARD") == 0) faceExcited();
+  else if (strcmp(displayAction, "REVERSE") == 0) faceNormal();
+  else if (strcmp(displayAction, "LEFT") == 0) faceLookLeft();
+  else if (strcmp(displayAction, "RIGHT") == 0) faceLookRight();
+  else if (strcmp(displayAction, "STOP") == 0) faceSmile();
+  else if (strcmp(displayAction, "CLIFF/OBS!") == 0) faceFear();
+  else if (strcmp(displayAction, "CLIFF!") == 0) faceFear();
+  else if (strcmp(displayAction, "SCANNING") == 0) faceNormal();
+  else if (strcmp(displayAction, "TURN L") == 0) faceLookLeft();
+  else if (strcmp(displayAction, "TURN R") == 0) faceLookRight();
+  else if (strcmp(displayAction, "TURN AROUND") == 0) faceSurprised();
+  else faceSmile();
+
+  lastMode = displayMode;
+  lastAction = displayAction;
+}
+
+// --- SENSOR FUNCTIONS ---
+int getDistance() {
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 25000);
+  int cm = duration * 0.034 / 2;
+  return (cm == 0) ? 999 : cm;
+}
+
+// --- MOTOR FUNCTIONS ---
+void driveForward(int speed) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, speed); analogWrite(enB, speed);
+}
+void driveBackward(int speed) {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, speed); analogWrite(enB, speed);
+}
+void driveLeft(int speed) {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, speed); analogWrite(enB, speed);
+}
+void driveRight(int speed) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, speed); analogWrite(enB, speed);
+}
+void stopCar() {
+  analogWrite(enA, 0);   analogWrite(enB, 0);
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+}
